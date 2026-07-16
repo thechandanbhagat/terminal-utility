@@ -1,6 +1,6 @@
-# Release Notes - SleekSSH v0.1.0
+# Release Notes - SleekSSH v0.1.1
 
-We are excited to announce the initial release of **SleekSSH** (v0.1.0), a lightweight, performance-focused desktop utility designed for developers, network engineers, and system administrators. 
+We are excited to announce the initial release of **SleekSSH** (v0.1.1), a lightweight, performance-focused desktop utility designed for developers, network engineers, and system administrators. 
 
 SleekSSH combines a modern terminal interface, secure file transfer capabilities, and Cisco VPN profile management into a single, cohesive application built with Tauri, Rust, and xterm.js.
 
@@ -32,7 +32,7 @@ SleekSSH combines a modern terminal interface, secure file transfer capabilities
 
 ## Installation & Setup
 
-1. Download the installer for your system from the [Releases Page](https://github.com/thechandanbhagat/terminal-utility/releases/tag/v0.1.0):
+1. Download the installer for your system from the [Releases Page](https://github.com/thechandanbhagat/terminal-utility/releases/tag/v0.1.1):
    - **MSI Installer (Recommended):** `SleekSSH_0.1.0_x64_en-US.msi`
    - **Standalone Setup EXE:** `SleekSSH_0.1.0_x64-setup.exe`
 2. Run the installer and launch **SleekSSH** from your desktop or start menu.

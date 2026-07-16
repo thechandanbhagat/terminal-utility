@@ -22,6 +22,15 @@
         <span>SleekSSH</span>
       </div>
       <div class="titlebar-controls">
+        <button class="titlebar-btn" id="titlebar-port-killer" title="Port Killer">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="22" y1="12" x2="18" y2="12"></line>
+            <line x1="6" y1="12" x2="2" y2="12"></line>
+            <line x1="12" y1="6" x2="12" y2="2"></line>
+            <line x1="12" y1="22" x2="12" y2="18"></line>
+          </svg>
+        </button>
         <button class="titlebar-btn" id="titlebar-settings" title="Settings">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transform: translateY(1px);"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
         </button>
@@ -50,7 +59,6 @@
           <button class="nav-tab active" data-tab="connections">Connections</button>
           <button class="nav-tab hidden" data-tab="vpn">VPN</button>
           <button class="nav-tab" data-tab="keys">Keys</button>
-          <button class="nav-tab" data-tab="quick-connect">Quick Connect</button>
         </nav>
 
         <div class="sidebar-content">
@@ -87,8 +95,12 @@
                 <span id="vpn-client-path">Detecting vpncli.exe...</span>
                 <button class="btn btn-secondary btn-small" id="btn-refresh-vpn-status">Refresh</button>
               </div>
+              <div class="vpn-connection-state is-unknown" id="vpn-connection-state" role="status" aria-live="polite">
+                <span class="vpn-connection-state-indicator" aria-hidden="true"></span>
+                <span id="vpn-connection-summary">VPN status not loaded.</span>
+              </div>
               <pre id="vpn-status-output">VPN status not loaded.</pre>
-              <button class="btn btn-secondary btn-full btn-small" id="btn-disconnect-vpn">Disconnect Current VPN</button>
+              <button class="btn btn-secondary btn-full btn-small" id="btn-disconnect-vpn" disabled>Disconnect Current VPN</button>
               <button class="btn btn-secondary btn-full btn-small hidden" id="btn-cancel-vpn-operation">Cancel Request</button>
             </div>
 
@@ -141,66 +153,6 @@
             </div>
           </div>
 
-          <!-- QUICK CONNECT TAB -->
-          <div class="tab-pane" id="pane-quick-connect">
-            <h3>Quick SSH Connection</h3>
-            <form id="quick-connect-form" class="connect-form">
-              <div class="form-group">
-                <label>Session Name</label>
-                <input type="text" id="qc-name" placeholder="My Server" value="Quick Session" required />
-              </div>
-              <div class="form-row">
-                <div class="form-group flex-3">
-                  <label>Host / IP</label>
-                  <input type="text" id="qc-host" placeholder="192.168.1.50" required />
-                </div>
-                <div class="form-group flex-1">
-                  <label>Port</label>
-                  <input type="number" id="qc-port" value="22" required />
-                </div>
-              </div>
-              <div class="form-group">
-                <label>Username</label>
-                <input type="text" id="qc-username" placeholder="root" required />
-              </div>
-              
-              <div class="form-group">
-                <label>Authentication Mode</label>
-                <div class="radio-group">
-                  <label class="radio-label">
-                    <input type="radio" name="qc-auth-mode" value="key" checked /> Key
-                  </label>
-                  <label class="radio-label">
-                    <input type="radio" name="qc-auth-mode" value="password" /> Password
-                  </label>
-                </div>
-              </div>
-
-              <!-- KEY AUTH FIELDS -->
-              <div id="qc-auth-key-fields" class="auth-fields">
-                <div class="form-group">
-                  <label>Private Key Path</label>
-                  <div class="file-input-wrapper">
-                    <input type="text" id="qc-keypath" placeholder="C:\Users\...\.ssh\id_ed25519" />
-                  </div>
-                </div>
-                <div class="form-group">
-                  <label>Key Passphrase (Optional)</label>
-                  <input type="password" id="qc-passphrase" placeholder="Key passphrase if any" />
-                </div>
-              </div>
-
-              <!-- PASSWORD AUTH FIELDS -->
-              <div id="qc-auth-password-fields" class="auth-fields hidden">
-                <div class="form-group">
-                  <label>Password</label>
-                  <input type="password" id="qc-password" placeholder="Remote password" />
-                </div>
-              </div>
-
-              <button type="submit" class="btn btn-primary btn-full btn-large">Connect</button>
-            </form>
-          </div>
         </div>
       </aside>
 
@@ -211,7 +163,7 @@
           <div class="tabs-container" id="tabs-container">
             <!-- Dynamically populated terminal tabs -->
           </div>
-          <button class="btn-new-tab" id="btn-new-tab-plus" title="New Session">
+          <button class="btn-new-tab" id="btn-new-tab-plus" title="Quick Connect (Ctrl+Alt+N)" aria-label="Quick Connect">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <line x1="12" y1="5" x2="12" y2="19"></line>
               <line x1="5" y1="12" x2="19" y2="12"></line>
@@ -237,6 +189,69 @@
       </main>
     </div>
 
+    <div class="modal-overlay hidden" id="quick-connect-modal" role="dialog" aria-modal="true" aria-labelledby="quick-connect-modal-title">
+      <div class="modal-card quick-connect-modal-card">
+        <div class="modal-header">
+          <h3 id="quick-connect-modal-title">Quick Connect</h3>
+          <button class="btn-close" id="btn-close-quick-connect-modal" type="button" aria-label="Close Quick Connect">&times;</button>
+        </div>
+        <form id="quick-connect-form" class="connect-form">
+          <p class="quick-connect-description">Connect without saving this server.</p>
+          <div class="form-group">
+            <label for="qc-name">Session Name</label>
+            <input type="text" id="qc-name" placeholder="My Server" value="Quick Session" required />
+          </div>
+          <div class="form-row">
+            <div class="form-group flex-3">
+              <label for="qc-host">Host / IP</label>
+              <input type="text" id="qc-host" placeholder="192.168.1.50" required />
+            </div>
+            <div class="form-group flex-1">
+              <label for="qc-port">Port</label>
+              <input type="number" id="qc-port" value="22" required />
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="qc-username">Username</label>
+            <input type="text" id="qc-username" placeholder="root" required />
+          </div>
+          <div class="form-group">
+            <span class="form-label">Authentication Mode</span>
+            <div class="radio-group">
+              <label class="radio-label">
+                <input type="radio" name="qc-auth-mode" value="key" checked /> Key
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="qc-auth-mode" value="password" /> Password
+              </label>
+            </div>
+          </div>
+          <div id="qc-auth-key-fields" class="auth-fields">
+            <div class="form-group">
+              <label for="qc-keypath">Private Key Path</label>
+              <div class="file-input-wrapper">
+                <input type="text" id="qc-keypath" placeholder="C:\Users\...\.ssh\id_ed25519" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="qc-passphrase">Key Passphrase (Optional)</label>
+              <input type="password" id="qc-passphrase" placeholder="Key passphrase if any" />
+            </div>
+          </div>
+          <div id="qc-auth-password-fields" class="auth-fields hidden">
+            <div class="form-group">
+              <label for="qc-password">Password</label>
+              <input type="password" id="qc-password" placeholder="Remote password" />
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" id="btn-cancel-quick-connect-modal">Cancel</button>
+            <button type="submit" class="btn btn-primary">Connect</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
     <!-- ADD/EDIT CONNECTION PROFILE MODAL -->
     <div class="modal-overlay hidden" id="profile-modal">
       <div class="modal-card">
@@ -252,7 +267,7 @@
           </div>
           <div class="form-group">
             <label>Group / Namespace (Optional)</label>
-            <input type="text" id="prof-namespace" placeholder="e.g. Production, Staging, Personal" />
+            <input type="text" id="prof-namespace" placeholder="e.g. Production/Europe" />
           </div>
           <div class="form-row">
             <div class="form-group flex-3">
@@ -369,6 +384,23 @@
             <button type="submit" class="btn btn-primary">Connect</button>
           </div>
         </form>
+      </div>
+    </div>
+
+    <div class="modal-overlay hidden" id="vpn-certificate-modal" role="dialog" aria-modal="true" aria-labelledby="vpn-certificate-title" aria-describedby="vpn-certificate-description">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3 id="vpn-certificate-title">VPN Certificate Warning</h3>
+          <button class="btn-close" id="btn-close-vpn-certificate-modal" type="button" aria-label="Close VPN Certificate Warning">&times;</button>
+        </div>
+        <div class="vpn-certificate-content">
+          <p id="vpn-certificate-description">Cisco reported that the certificate for <strong id="vpn-certificate-server"></strong> does not match the server name and has expired.</p>
+          <p class="helper-text">Continue only if you trust this VPN server. Approval applies to this connection attempt only and is not saved.</p>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btn-cancel-vpn-certificate-modal">Cancel</button>
+          <button type="button" class="btn btn-primary" id="btn-accept-vpn-certificate-modal">Continue Once</button>
+        </div>
       </div>
     </div>
   </body>
