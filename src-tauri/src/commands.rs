@@ -1,9 +1,14 @@
 use crate::connection::{SessionInput, SshConnection, SshOutputPayload};
 use crate::DbSessionMap;
 use serde::{Deserialize, Serialize};
+use ssh2::Session;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
+
+const INTERACTIVE_SSH_TIMEOUT_MILLISECONDS: u32 = 50;
+const SFTP_DIRECTORY_TIMEOUT_MILLISECONDS: u32 = 5_000;
+const SFTP_TRANSFER_TIMEOUT_MILLISECONDS: u32 = 30_000;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConnectionProfile {
@@ -17,6 +22,24 @@ pub struct ConnectionProfile {
     pub password: Option<String>,
     pub use_password: bool,
     pub namespace: Option<String>,
+}
+
+struct SftpSessionTimeoutReset<'a> {
+    session: &'a Session,
+}
+
+impl<'a> SftpSessionTimeoutReset<'a> {
+    fn new(session: &'a Session, timeout_milliseconds: u32) -> Self {
+        session.set_timeout(timeout_milliseconds);
+        Self { session }
+    }
+}
+
+impl Drop for SftpSessionTimeoutReset<'_> {
+    fn drop(&mut self) {
+        self.session
+            .set_timeout(INTERACTIVE_SSH_TIMEOUT_MILLISECONDS);
+    }
 }
 
 #[tauri::command]
@@ -133,7 +156,7 @@ pub fn save_connections(connections: Vec<ConnectionProfile>) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub fn connect_ssh(
+pub async fn connect_ssh(
     app_handle: AppHandle,
     state: State<'_, DbSessionMap>,
     session_id: String,
@@ -145,8 +168,40 @@ pub fn connect_ssh(
     password: Option<String>,
     use_password: bool,
 ) -> Result<(), String> {
+    let task_session_id = session_id.clone();
+    let connection = tauri::async_runtime::spawn_blocking(move || {
+        connect_ssh_blocking(
+            app_handle,
+            task_session_id,
+            host,
+            port,
+            username,
+            key_path,
+            passphrase,
+            password,
+            use_password,
+        )
+    })
+    .await
+    .map_err(|error| format!("SSH connection task failed: {}", error))??;
+
+    let mut map = state.lock().unwrap();
+    map.insert(session_id, connection);
+    Ok(())
+}
+
+fn connect_ssh_blocking(
+    app_handle: AppHandle,
+    session_id: String,
+    host: String,
+    port: u16,
+    username: String,
+    key_path: String,
+    passphrase: Option<String>,
+    password: Option<String>,
+    use_password: bool,
+) -> Result<SshConnection, String> {
     use base64::Engine;
-    use ssh2::Session;
     use std::io::{ErrorKind, Read};
     use std::net::TcpStream;
     use std::sync::atomic::AtomicBool;
@@ -232,7 +287,7 @@ pub fn connect_ssh(
         // Configure session timeout to 50ms for non-blocking interactive I/O
         {
             let sess_guard = session_clone.lock().unwrap();
-            sess_guard.set_timeout(50);
+            sess_guard.set_timeout(INTERACTIVE_SSH_TIMEOUT_MILLISECONDS);
         }
 
         let mut buf = [0u8; 8192];
@@ -242,7 +297,11 @@ pub fn connect_ssh(
             }
 
             // Read output
-            match channel.read(&mut buf) {
+            let read_result = {
+                let _session_guard = session_clone.lock().unwrap();
+                channel.read(&mut buf)
+            };
+            match read_result {
                 Ok(0) => {
                     let _ = app_handle_clone.emit(
                         "ssh-closed",
@@ -288,7 +347,11 @@ pub fn connect_ssh(
                     SessionInput::Write(data) => {
                         let mut written = 0;
                         while written < data.len() {
-                            match channel.write(&data[written..]) {
+                            let write_result = {
+                                let _session_guard = session_clone.lock().unwrap();
+                                channel.write(&data[written..])
+                            };
+                            match write_result {
                                 Ok(n) => {
                                     written += n;
                                 }
@@ -306,7 +369,11 @@ pub fn connect_ssh(
                         }
                     }
                     SessionInput::Resize { cols, rows } => {
-                        if let Err(e) = channel.request_pty_size(cols, rows, None, None) {
+                        let resize_result = {
+                            let _session_guard = session_clone.lock().unwrap();
+                            channel.request_pty_size(cols, rows, None, None)
+                        };
+                        if let Err(e) = resize_result {
                             eprintln!("Failed to resize PTY: {:?}", e);
                         }
                     }
@@ -316,23 +383,17 @@ pub fn connect_ssh(
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
+        let _session_guard = session_clone.lock().unwrap();
         let _ = channel.close();
         let _ = channel.wait_close();
     });
 
-    // Save connection state
-    let mut map = state.lock().unwrap();
-    map.insert(
-        session_id,
-        SshConnection {
-            session,
-            tcp,
-            write_tx: tx,
-            should_exit,
-        },
-    );
-
-    Ok(())
+    Ok(SshConnection {
+        session,
+        tcp,
+        write_tx: tx,
+        should_exit,
+    })
 }
 
 #[tauri::command]
@@ -406,22 +467,45 @@ pub struct RemoteFile {
     pub size: u64,
 }
 
+fn sftp_session_for(state: &DbSessionMap, session_id: &str) -> Result<Arc<Mutex<Session>>, String> {
+    let map = state.lock().unwrap();
+    map.get(session_id)
+        .map(|connection| Arc::clone(&connection.session))
+        .ok_or_else(|| "Session not found".to_string())
+}
+
+async fn run_sftp_task<T>(
+    task: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|e| format!("SFTP task failed: {}", e))?
+}
+
 #[tauri::command]
-pub fn sftp_list_directory(
+pub async fn sftp_list_directory(
     state: State<'_, DbSessionMap>,
     session_id: String,
     path: String,
 ) -> Result<Vec<RemoteFile>, String> {
-    let map = state.lock().unwrap();
-    let conn = map
-        .get(&session_id)
-        .ok_or_else(|| "Session not found".to_string())?;
-    let sess = conn.session.lock().unwrap();
+    let session = sftp_session_for(&state, &session_id)?;
+    run_sftp_task(move || sftp_list_directory_internal(&session, &path)).await
+}
+
+fn sftp_list_directory_internal(
+    session: &Arc<Mutex<Session>>,
+    path: &str,
+) -> Result<Vec<RemoteFile>, String> {
+    let sess = session.lock().unwrap();
+    let _timeout_reset = SftpSessionTimeoutReset::new(&sess, SFTP_DIRECTORY_TIMEOUT_MILLISECONDS);
     let sftp = sess
         .sftp()
         .map_err(|e| format!("Failed to open SFTP session: {}", e))?;
 
-    let target_path = std::path::Path::new(&path);
+    let target_path = std::path::Path::new(path);
     let files = sftp
         .readdir(target_path)
         .map_err(|e| format!("Failed to read directory: {}", e))?;
@@ -461,29 +545,56 @@ pub fn sftp_list_directory(
 }
 
 #[tauri::command]
-pub fn sftp_download_file(
+pub async fn sftp_resolve_path(
+    state: State<'_, DbSessionMap>,
+    session_id: String,
+    path: String,
+) -> Result<String, String> {
+    let session = sftp_session_for(&state, &session_id)?;
+    run_sftp_task(move || sftp_resolve_path_internal(&session, &path)).await
+}
+
+fn sftp_resolve_path_internal(session: &Arc<Mutex<Session>>, path: &str) -> Result<String, String> {
+    let sess = session.lock().unwrap();
+    let _timeout_reset = SftpSessionTimeoutReset::new(&sess, SFTP_DIRECTORY_TIMEOUT_MILLISECONDS);
+    let sftp = sess
+        .sftp()
+        .map_err(|e| format!("Failed to open SFTP session: {}", e))?;
+
+    sftp.realpath(std::path::Path::new(path))
+        .map(|resolved_path| resolved_path.to_string_lossy().to_string())
+        .map_err(|e| format!("Failed to resolve directory path: {}", e))
+}
+
+#[tauri::command]
+pub async fn sftp_download_file(
     state: State<'_, DbSessionMap>,
     session_id: String,
     remote_path: String,
     local_path: String,
 ) -> Result<(), String> {
+    let session = sftp_session_for(&state, &session_id)?;
+    run_sftp_task(move || sftp_download_file_internal(&session, &remote_path, &local_path)).await
+}
+
+fn sftp_download_file_internal(
+    session: &Arc<Mutex<Session>>,
+    remote_path: &str,
+    local_path: &str,
+) -> Result<(), String> {
     use std::io::{Read, Write};
 
-    let map = state.lock().unwrap();
-    let conn = map
-        .get(&session_id)
-        .ok_or_else(|| "Session not found".to_string())?;
-
-    let mut local_file = std::fs::File::create(&local_path)
+    let mut local_file = std::fs::File::create(local_path)
         .map_err(|e| format!("Failed to create local file: {}", e))?;
 
-    let sess = conn.session.lock().unwrap();
+    let sess = session.lock().unwrap();
+    let _timeout_reset = SftpSessionTimeoutReset::new(&sess, SFTP_TRANSFER_TIMEOUT_MILLISECONDS);
     let sftp = sess
         .sftp()
         .map_err(|e| format!("Failed to open SFTP session: {}", e))?;
 
     let mut remote_file = sftp
-        .open(std::path::Path::new(&remote_path))
+        .open(std::path::Path::new(remote_path))
         .map_err(|e| format!("Failed to open remote file: {}", e))?;
 
     let mut buf = [0u8; 16384];
@@ -503,29 +614,34 @@ pub fn sftp_download_file(
 }
 
 #[tauri::command]
-pub fn sftp_upload_file(
+pub async fn sftp_upload_file(
     state: State<'_, DbSessionMap>,
     session_id: String,
     local_path: String,
     remote_path: String,
 ) -> Result<(), String> {
+    let session = sftp_session_for(&state, &session_id)?;
+    run_sftp_task(move || sftp_upload_file_internal(&session, &local_path, &remote_path)).await
+}
+
+fn sftp_upload_file_internal(
+    session: &Arc<Mutex<Session>>,
+    local_path: &str,
+    remote_path: &str,
+) -> Result<(), String> {
     use std::io::{Read, Write};
 
-    let map = state.lock().unwrap();
-    let conn = map
-        .get(&session_id)
-        .ok_or_else(|| "Session not found".to_string())?;
+    let mut local_file =
+        std::fs::File::open(local_path).map_err(|e| format!("Failed to open local file: {}", e))?;
 
-    let mut local_file = std::fs::File::open(&local_path)
-        .map_err(|e| format!("Failed to open local file: {}", e))?;
-
-    let sess = conn.session.lock().unwrap();
+    let sess = session.lock().unwrap();
+    let _timeout_reset = SftpSessionTimeoutReset::new(&sess, SFTP_TRANSFER_TIMEOUT_MILLISECONDS);
     let sftp = sess
         .sftp()
         .map_err(|e| format!("Failed to open SFTP session: {}", e))?;
 
     let mut remote_file = sftp
-        .create(std::path::Path::new(&remote_path))
+        .create(std::path::Path::new(remote_path))
         .map_err(|e| format!("Failed to create remote file: {}", e))?;
 
     let mut buf = [0u8; 16384];
@@ -545,61 +661,67 @@ pub fn sftp_upload_file(
 }
 
 #[tauri::command]
-pub fn sftp_create_directory(
+pub async fn sftp_create_directory(
     state: State<'_, DbSessionMap>,
     session_id: String,
     path: String,
 ) -> Result<(), String> {
-    let map = state.lock().unwrap();
-    let conn = map
-        .get(&session_id)
-        .ok_or_else(|| "Session not found".to_string())?;
-    let sess = conn.session.lock().unwrap();
+    let session = sftp_session_for(&state, &session_id)?;
+    run_sftp_task(move || sftp_create_directory_internal(&session, &path)).await
+}
+
+fn sftp_create_directory_internal(session: &Arc<Mutex<Session>>, path: &str) -> Result<(), String> {
+    let sess = session.lock().unwrap();
+    let _timeout_reset = SftpSessionTimeoutReset::new(&sess, SFTP_DIRECTORY_TIMEOUT_MILLISECONDS);
     let sftp = sess
         .sftp()
         .map_err(|e| format!("Failed to open SFTP session: {}", e))?;
 
-    sftp.mkdir(std::path::Path::new(&path), 0o755)
+    sftp.mkdir(std::path::Path::new(path), 0o755)
         .map_err(|e| format!("Failed to create directory: {}", e))?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn sftp_delete_file(
+pub async fn sftp_delete_file(
     state: State<'_, DbSessionMap>,
     session_id: String,
     path: String,
 ) -> Result<(), String> {
-    let map = state.lock().unwrap();
-    let conn = map
-        .get(&session_id)
-        .ok_or_else(|| "Session not found".to_string())?;
-    let sess = conn.session.lock().unwrap();
+    let session = sftp_session_for(&state, &session_id)?;
+    run_sftp_task(move || sftp_delete_file_internal(&session, &path)).await
+}
+
+fn sftp_delete_file_internal(session: &Arc<Mutex<Session>>, path: &str) -> Result<(), String> {
+    let sess = session.lock().unwrap();
+    let _timeout_reset = SftpSessionTimeoutReset::new(&sess, SFTP_DIRECTORY_TIMEOUT_MILLISECONDS);
     let sftp = sess
         .sftp()
         .map_err(|e| format!("Failed to open SFTP session: {}", e))?;
 
-    sftp.unlink(std::path::Path::new(&path))
+    sftp.unlink(std::path::Path::new(path))
         .map_err(|e| format!("Failed to delete file: {}", e))?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn sftp_delete_directory(
+pub async fn sftp_delete_directory(
     state: State<'_, DbSessionMap>,
     session_id: String,
     path: String,
 ) -> Result<(), String> {
-    let map = state.lock().unwrap();
-    let conn = map
-        .get(&session_id)
-        .ok_or_else(|| "Session not found".to_string())?;
-    let sess = conn.session.lock().unwrap();
+    let session = sftp_session_for(&state, &session_id)?;
+    run_sftp_task(move || sftp_delete_directory_internal(&session, &path)).await
+}
+
+fn sftp_delete_directory_internal(session: &Arc<Mutex<Session>>, path: &str) -> Result<(), String> {
+    let sess = session.lock().unwrap();
+    let _timeout_reset = SftpSessionTimeoutReset::new(&sess, SFTP_DIRECTORY_TIMEOUT_MILLISECONDS);
     let sftp = sess
         .sftp()
         .map_err(|e| format!("Failed to open SFTP session: {}", e))?;
 
-    sftp.rmdir(std::path::Path::new(&path))
+    sftp.rmdir(std::path::Path::new(path))
         .map_err(|e| format!("Failed to delete directory: {}", e))?;
     Ok(())
 }
@@ -614,4 +736,135 @@ pub fn select_download_destination(filename: String) -> Result<Option<String>, S
 pub fn select_upload_file() -> Result<Option<String>, String> {
     let file = rfd::FileDialog::new().pick_file();
     Ok(file.map(|p| p.to_string_lossy().to_string()))
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct PortEntry {
+    pub protocol: String,
+    pub local_port: u16,
+    pub state: String,
+    pub pid: u32,
+    pub process_name: String,
+}
+
+#[tauri::command]
+pub fn list_listening_ports() -> Result<Vec<PortEntry>, String> {
+    use std::collections::HashMap;
+    use std::process::Command;
+
+    let netstat = Command::new("netstat")
+        .args(["-ano"])
+        .output()
+        .map_err(|e| format!("Failed to run netstat: {}", e))?;
+    let netstat_out = String::from_utf8_lossy(&netstat.stdout).to_string();
+
+    let tasklist = Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .output()
+        .map_err(|e| format!("Failed to run tasklist: {}", e))?;
+    let tasklist_out = String::from_utf8_lossy(&tasklist.stdout).to_string();
+
+    let mut pid_to_name: HashMap<u32, String> = HashMap::new();
+    for line in tasklist_out.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // CSV: "name","pid","session","num","mem"
+        let parts: Vec<&str> = line.splitn(6, ',').collect();
+        if parts.len() >= 2 {
+            let name = parts[0].trim_matches('"').to_string();
+            if let Ok(pid) = parts[1].trim_matches('"').parse::<u32>() {
+                pid_to_name.insert(pid, name);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    for line in netstat_out.lines() {
+        let line = line.trim();
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let proto = parts[0];
+        if proto != "TCP" && proto != "UDP" {
+            continue;
+        }
+        if parts.len() < 4 {
+            continue;
+        }
+        let local_addr = parts[1];
+        let local_port = match local_addr.rfind(':') {
+            Some(pos) => match local_addr[pos + 1..].parse::<u16>() {
+                Ok(p) => p,
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+        let (state, pid_str) = if proto == "TCP" {
+            if parts.len() < 5 {
+                continue;
+            }
+            (parts[3].to_string(), parts[4])
+        } else {
+            (String::new(), parts[3])
+        };
+        let pid = match pid_str.parse::<u32>() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let process_name = pid_to_name
+            .get(&pid)
+            .cloned()
+            .unwrap_or_else(|| format!("PID {}", pid));
+
+        entries.push(PortEntry {
+            protocol: proto.to_string(),
+            local_port,
+            state,
+            pid,
+            process_name,
+        });
+    }
+
+    entries.sort_by_key(|e| e.local_port);
+    Ok(entries)
+}
+
+#[tauri::command]
+pub fn kill_port_process(pid: u32) -> Result<String, String> {
+    use std::process::Command;
+
+    let output = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .output()
+        .map_err(|e| format!("Failed to run taskkill: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        Err(if !stderr.is_empty() { stderr } else { stdout })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sftp_timeouts_allow_remote_operations_to_wait_longer_than_terminal_polls() {
+        assert!(SFTP_DIRECTORY_TIMEOUT_MILLISECONDS > INTERACTIVE_SSH_TIMEOUT_MILLISECONDS);
+        assert!(SFTP_TRANSFER_TIMEOUT_MILLISECONDS > SFTP_DIRECTORY_TIMEOUT_MILLISECONDS);
+    }
+
+    #[tokio::test]
+    async fn run_sftp_task_returns_the_background_task_result() {
+        let result = run_sftp_task(|| Ok("completed".to_string())).await;
+
+        assert_eq!(result.unwrap(), "completed");
+    }
 }
